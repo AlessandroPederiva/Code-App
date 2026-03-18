@@ -1,11 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import '../styles/FlatMapGame.css'
+import { BlockId, BLOCKS, DEFAULT_HOTBAR, isSolidBlock } from '../game/blocks'
+import { ChunkedWorld } from '../game/chunkedWorld'
+import { buildRegionGeometry, type TriangleMeta } from '../game/mesher.ts'
+import { pickBlockTarget } from '../game/raycast.ts'
 
 export function FlatMapGame() {
   const containerRef = useRef<HTMLDivElement>(null)
-  const [score, setScore] = useState(0)
-  const [coinsLeft, setCoinsLeft] = useState(10)
+  const [selectedSlot, setSelectedSlot] = useState(0)
+  const hotbar = useMemo(() => DEFAULT_HOTBAR, [])
+  const selectedBlock: BlockId = hotbar[Math.max(0, Math.min(8, selectedSlot))]
+  const selectedBlockRef = useRef<BlockId>(selectedBlock)
+  selectedBlockRef.current = selectedBlock
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -20,8 +27,8 @@ export function FlatMapGame() {
     const height = window.innerHeight
 
     // Camera prima persona
-    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000)
-    camera.position.set(0, 1.6, 0) // Altezza occhi umani ~1.6m
+    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 2000)
+    camera.position.set(16, 2.6, 16) // start near center
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setSize(width, height)
@@ -34,67 +41,215 @@ export function FlatMapGame() {
     scene.add(directionalLight)
     scene.add(new THREE.AmbientLight(0xffffff, 0.5))
 
-    // === PAVIMENTO a y=0 ===
-    const floorSize = 300
-    const floorGeometry = new THREE.PlaneGeometry(floorSize, floorSize)
-    const floorMaterial = new THREE.MeshStandardMaterial({
-      color: 0x4ade80, // Verde brillante
-      side: THREE.DoubleSide,
+    // === CHUNKED WORLD (bigger map) ===
+    const seed = 1337
+    const world = new ChunkedWorld({
+      seed,
+      chunkSize: 16,
+      height: 64,
+      baseHeight: 26,
+      heightScale: 18,
+      freq: 2.2,
+      octaves: 4,
+      lacunarity: 2,
+      persistence: 0.5,
+      stoneDepth: 8,
+      pondLevel: 22,
     })
-    const floor = new THREE.Mesh(floorGeometry, floorMaterial)
-    floor.rotation.x = -Math.PI / 2
-    floor.position.y = 0
-    scene.add(floor)
 
-    // Griglia sul pavimento
-    const gridHelper = new THREE.GridHelper(floorSize, 60, 0xffffff, 0x888888)
-    gridHelper.position.y = 0.01
-    scene.add(gridHelper)
-
-    // === ORIZZONTE ===
-    // Piano lontano per l'orizzonte
-    const horizonSize = 1200
-    const horizonGeometry = new THREE.PlaneGeometry(horizonSize, horizonSize)
-    const horizonMaterial = new THREE.MeshStandardMaterial({
-      color: 0x98d8c8, // Verde acqua per orizzonte
-      side: THREE.DoubleSide,
+    // === CHUNK MESH (single chunk for MVP) ===
+    const chunkMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 1,
     })
-    const horizon = new THREE.Mesh(horizonGeometry, horizonMaterial)
-    horizon.rotation.x = -Math.PI / 2
-    horizon.position.y = -0.1 // Sotto il pavimento principale
-    scene.add(horizon)
+    const waterMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.35,
+      metalness: 0,
+      transparent: true,
+      opacity: 0.65,
+      depthWrite: false,
+    })
+    type ChunkRender = {
+      cx: number
+      cz: number
+      opaqueMesh: THREE.Mesh
+      waterMesh: THREE.Mesh
+      triangleMetaOpaque: TriangleMeta[]
+      triangleMetaWater: TriangleMeta[]
+    }
+    const chunkRenders = new Map<string, ChunkRender>()
 
-    // === PLAYER POSITION (invisibile in prima persona) ===
-    const playerPos = new THREE.Vector3(0, 0, 0)
+    const ensureChunkRender = (cx: number, cz: number) => {
+      const key = `${cx},${cz}`
+      const existing = chunkRenders.get(key)
+      if (existing) return existing
+
+      const opaque = new THREE.Mesh(new THREE.BufferGeometry(), chunkMaterial)
+      const water = new THREE.Mesh(new THREE.BufferGeometry(), waterMaterial)
+      water.renderOrder = 1
+      scene.add(opaque)
+      scene.add(water)
+
+      const cr: ChunkRender = {
+        cx,
+        cz,
+        opaqueMesh: opaque,
+        waterMesh: water,
+        triangleMetaOpaque: [],
+        triangleMetaWater: [],
+      }
+      chunkRenders.set(key, cr)
+      return cr
+    }
+
+    const rebuildChunk = (cx: number, cz: number) => {
+      // ensure chunk exists
+      world.getChunk(cx, cz)
+      const cr = ensureChunkRender(cx, cz)
+
+      const originX = cx * world.chunkSize
+      const originZ = cz * world.chunkSize
+      const built = buildRegionGeometry({
+        getBlock: (x, y, z) => world.get(x, y, z),
+        sizeX: world.chunkSize,
+        sizeY: world.height,
+        sizeZ: world.chunkSize,
+        originX,
+        originY: 0,
+        originZ,
+        blockDefs: BLOCKS,
+      })
+
+      cr.triangleMetaOpaque = built.opaque.triangles
+      cr.triangleMetaWater = built.transparent.triangles
+
+      cr.opaqueMesh.geometry.dispose()
+      cr.waterMesh.geometry.dispose()
+      cr.opaqueMesh.geometry = built.opaque.geometry
+      cr.waterMesh.geometry = built.transparent.geometry
+      cr.opaqueMesh.geometry.computeBoundingSphere()
+      cr.waterMesh.geometry.computeBoundingSphere()
+    }
+
+    const chunkRadius = 2
+    const updateActiveChunks = () => {
+      const pcx = Math.floor(playerPos.x / world.chunkSize)
+      const pcz = Math.floor(playerPos.z / world.chunkSize)
+
+      const keep = new Set<string>()
+      for (let dz = -chunkRadius; dz <= chunkRadius; dz++) {
+        for (let dx = -chunkRadius; dx <= chunkRadius; dx++) {
+          const cx = pcx + dx
+          const cz = pcz + dz
+          const k = `${cx},${cz}`
+          keep.add(k)
+          world.getChunk(cx, cz)
+          const cr = ensureChunkRender(cx, cz)
+          if (world.consumeDirty(cx, cz)) {
+            rebuildChunk(cx, cz)
+          } else if (cr.opaqueMesh.geometry.getAttribute('position') == null) {
+            rebuildChunk(cx, cz)
+          }
+        }
+      }
+
+      for (const [k, cr] of chunkRenders.entries()) {
+        if (keep.has(k)) continue
+        scene.remove(cr.opaqueMesh)
+        scene.remove(cr.waterMesh)
+        cr.opaqueMesh.geometry.dispose()
+        cr.waterMesh.geometry.dispose()
+        chunkRenders.delete(k)
+      }
+      world.unloadFar(keep)
+    }
+
+    // === SAVE/LOAD (simple edits log; global coords) ===
+    const SAVE_KEY = 'voxel_world_edits_v1'
+    const loadEdits = () => {
+      try {
+        const raw = localStorage.getItem(SAVE_KEY)
+        if (!raw) return
+        const parsed = JSON.parse(raw) as Array<{
+          x: number
+          y: number
+          z: number
+          id: number
+        }>
+        for (const e of parsed) world.set(e.x, e.y, e.z, e.id as BlockId)
+      } catch {
+        // ignore
+      }
+    }
+    const saveEditsRef = { current: [] as Array<{ x: number; y: number; z: number; id: BlockId }> }
+    const persistEdits = () => {
+      try {
+        localStorage.setItem(SAVE_KEY, JSON.stringify(saveEditsRef.current))
+      } catch {
+        // ignore
+      }
+    }
+
+    loadEdits()
+
+    // === TARGET HIGHLIGHT ===
+    const raycaster = new THREE.Raycaster()
+    const highlightMaterial = new THREE.LineBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.85,
+    })
+    const highlightGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1))
+    const highlight = new THREE.LineSegments(highlightGeometry, highlightMaterial)
+    highlight.visible = false
+    scene.add(highlight)
+
+    // === PLAYER POSITION (feet position in world units) ===
+    const playerPos = new THREE.Vector3(8, 55, 8)
     const eyeHeight = 1.6
 
     // === JUMP / GRAVITY ===
     let verticalVelocity = 0
     const gravity = 0.012
     const jumpVelocity = 0.22
-    const groundY = 0
-    const isOnGround = () => playerPos.y <= groundY + 1e-6
+    const playerRadius = 0.32
+    const playerHeight = 1.8
 
-    // === MONETE ===
-    const coins: THREE.Mesh[] = []
-    const coinGeometry = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 16)
-    const coinMaterial = new THREE.MeshStandardMaterial({
-      color: 0xffd700,
-      metalness: 0.8,
-      roughness: 0.2,
-    })
+    const aabbOverlapsSolid = (x: number, y: number, z: number) => {
+      const minX = x - playerRadius
+      const maxX = x + playerRadius
+      const minY = y
+      const maxY = y + playerHeight
+      const minZ = z - playerRadius
+      const maxZ = z + playerRadius
 
-    for (let i = 0; i < 10; i++) {
-      const coin = new THREE.Mesh(coinGeometry, coinMaterial)
-      coin.rotation.x = Math.PI / 2
-      const coinSpawnRadius = floorSize * 0.45
-      coin.position.set(
-        (Math.random() - 0.5) * coinSpawnRadius,
-        0.15,
-        (Math.random() - 0.5) * coinSpawnRadius,
-      )
-      scene.add(coin)
-      coins.push(coin)
+      const x0 = Math.floor(minX)
+      const x1 = Math.floor(maxX)
+      const y0 = Math.floor(minY)
+      const y1 = Math.floor(maxY)
+      const z0 = Math.floor(minZ)
+      const z1 = Math.floor(maxZ)
+
+      for (let bz = z0; bz <= z1; bz++) {
+        for (let by = y0; by <= y1; by++) {
+          for (let bx = x0; bx <= x1; bx++) {
+            if (isSolidBlock(world.get(bx, by, bz))) return true
+          }
+        }
+      }
+      return false
+    }
+
+    const isOnGround = () => {
+      const epsilon = 0.05
+      return aabbOverlapsSolid(playerPos.x, playerPos.y - epsilon, playerPos.z)
+    }
+
+    // If we spawned inside blocks, move up a bit.
+    for (let i = 0; i < 20; i++) {
+      if (!aabbOverlapsSolid(playerPos.x, playerPos.y, playerPos.z)) break
+      playerPos.y += 1
     }
 
     // === CONTROLLI TASTIERA ===
@@ -102,6 +257,14 @@ export function FlatMapGame() {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       keys[e.key.toLowerCase()] = true
+
+      // Hotbar 1-9
+      if (e.code.startsWith('Digit')) {
+        const n = Number(e.code.replace('Digit', ''))
+        if (Number.isFinite(n) && n >= 1 && n <= 9) {
+          setSelectedSlot(n - 1)
+        }
+      }
     }
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -154,16 +317,143 @@ export function FlatMapGame() {
     // Click/tap anywhere in the game area to lock pointer
     containerEl.addEventListener('pointerdown', requestPointerLock)
 
+    const preventContextMenu = (e: MouseEvent) => {
+      e.preventDefault()
+    }
+    containerEl.addEventListener('contextmenu', preventContextMenu)
+
     // === MOVIMENTO ===
     const moveSpeed = 0.15
     const runMultiplier = 2
-    const halfFloor = floorSize / 2 - 2
+    const getTarget = () => {
+      let best: ReturnType<typeof pickBlockTarget> = null
+      let bestDist = Infinity
+
+      for (const cr of chunkRenders.values()) {
+        const a = pickBlockTarget({
+          raycaster,
+          camera,
+          object: cr.opaqueMesh,
+          triangles: cr.triangleMetaOpaque,
+          maxDistance: 6,
+        })
+        if (a) {
+          const d = a.hitPoint.distanceTo(camera.position)
+          if (d < bestDist) {
+            best = a
+            bestDist = d
+          }
+        }
+
+        const b = pickBlockTarget({
+          raycaster,
+          camera,
+          object: cr.waterMesh,
+          triangles: cr.triangleMetaWater,
+          maxDistance: 6,
+        })
+        if (b) {
+          const d = b.hitPoint.distanceTo(camera.position)
+          if (d < bestDist) {
+            best = b
+            bestDist = d
+          }
+        }
+      }
+
+      return best
+    }
+
+    const canPlaceAt = (x: number, y: number, z: number) => {
+      if (isSolidBlock(world.get(x, y, z))) return false
+
+      // prevent placing inside player AABB
+      const centerX = x + 0.5
+      const centerY = y + 0.5
+      const centerZ = z + 0.5
+      const closestX = Math.max(
+        playerPos.x - playerRadius,
+        Math.min(centerX, playerPos.x + playerRadius),
+      )
+      const closestY = Math.max(playerPos.y, Math.min(centerY, playerPos.y + playerHeight))
+      const closestZ = Math.max(
+        playerPos.z - playerRadius,
+        Math.min(centerZ, playerPos.z + playerRadius),
+      )
+      const dx = centerX - closestX
+      const dy = centerY - closestY
+      const dz = centerZ - closestZ
+      if (dx * dx + dy * dy + dz * dz < 0.25) return false
+
+      return true
+    }
+
+    const onActionPointerDown = (e: PointerEvent) => {
+      if (!isPointerLocked) return
+
+      const target = getTarget()
+      if (!target) return
+
+      if (e.button === 0) {
+        // break
+        const brokenId = world.get(target.blockX, target.blockY, target.blockZ)
+        world.set(target.blockX, target.blockY, target.blockZ, BlockId.Air)
+        const { cx, cz, lx, lz } = world.globalToChunk(target.blockX, target.blockZ)
+        world.markDirty(cx, cz)
+        if (lx === 0) world.markDirty(cx - 1, cz)
+        if (lx === world.chunkSize - 1) world.markDirty(cx + 1, cz)
+        if (lz === 0) world.markDirty(cx, cz - 1)
+        if (lz === world.chunkSize - 1) world.markDirty(cx, cz + 1)
+        saveEditsRef.current.push({
+          x: target.blockX,
+          y: target.blockY,
+          z: target.blockZ,
+          id: BlockId.Air,
+        })
+        persistEdits()
+
+        // drop a pickup item (simple "object")
+        if (brokenId !== BlockId.Air && brokenId !== BlockId.Water) {
+          const pickup = new THREE.Mesh(
+            new THREE.BoxGeometry(0.25, 0.25, 0.25),
+            new THREE.MeshStandardMaterial({ color: BLOCKS[brokenId].color }),
+          )
+          pickup.position.set(target.blockX + 0.5, target.blockY + 0.6, target.blockZ + 0.5)
+          pickup.userData = { blockId: brokenId, velY: 0.02 }
+          scene.add(pickup)
+          pickups.push(pickup)
+        }
+      } else if (e.button === 2) {
+        // place adjacent
+        const px = target.blockX + target.normalX
+        const py = target.blockY + target.normalY
+        const pz = target.blockZ + target.normalZ
+
+        const id = selectedBlockRef.current
+        if (id !== BlockId.Air && canPlaceAt(px, py, pz)) {
+          world.set(px, py, pz, id)
+          const { cx, cz, lx, lz } = world.globalToChunk(px, pz)
+          world.markDirty(cx, cz)
+          if (lx === 0) world.markDirty(cx - 1, cz)
+          if (lx === world.chunkSize - 1) world.markDirty(cx + 1, cz)
+          if (lz === 0) world.markDirty(cx, cz - 1)
+          if (lz === world.chunkSize - 1) world.markDirty(cx, cz + 1)
+          saveEditsRef.current.push({ x: px, y: py, z: pz, id })
+          persistEdits()
+        }
+      }
+    }
+    containerEl.addEventListener('pointerdown', onActionPointerDown)
+
+    // === OBJECTS: simple pickups ===
+    const pickups: THREE.Mesh[] = []
 
     // === ANIMATION LOOP ===
     let animationId: number
 
     const animate = () => {
       animationId = requestAnimationFrame(animate)
+      updateActiveChunks()
 
       // Movimento WASD
       const direction = new THREE.Vector3()
@@ -197,20 +487,40 @@ export function FlatMapGame() {
         keys['space'] = false
       }
 
+      const desiredMove = new THREE.Vector3()
       if (direction.length() > 0) {
         direction.normalize()
         const speed = moveSpeed * (keys['shift'] ? runMultiplier : 1)
-        playerPos.add(direction.multiplyScalar(speed))
-        playerPos.x = Math.max(-halfFloor, Math.min(halfFloor, playerPos.x))
-        playerPos.z = Math.max(-halfFloor, Math.min(halfFloor, playerPos.z))
+        desiredMove.copy(direction).multiplyScalar(speed)
       }
 
-      // Gravity integration
+      // Horizontal collision (axis-separated)
+      if (desiredMove.lengthSq() > 0) {
+        const nextX = playerPos.x + desiredMove.x
+        if (!aabbOverlapsSolid(nextX, playerPos.y, playerPos.z)) {
+          playerPos.x = nextX
+        }
+
+        const nextZ = playerPos.z + desiredMove.z
+        if (!aabbOverlapsSolid(playerPos.x, playerPos.y, nextZ)) {
+          playerPos.z = nextZ
+        }
+      }
+
+      // Gravity + vertical collision (sub-stepped)
       verticalVelocity -= gravity
-      playerPos.y += verticalVelocity
-      if (playerPos.y < groundY) {
-        playerPos.y = groundY
+      const steps = 6
+      const stepVel = verticalVelocity / steps
+      for (let i = 0; i < steps; i++) {
+        const nextY = playerPos.y + stepVel
+        if (!aabbOverlapsSolid(playerPos.x, nextY, playerPos.z)) {
+          playerPos.y = nextY
+          continue
+        }
+
+        // collision: stop at current y and zero velocity
         verticalVelocity = 0
+        break
       }
 
       // Aggiorna posizione camera
@@ -218,23 +528,36 @@ export function FlatMapGame() {
       camera.position.y = eyeHeight + playerPos.y
       camera.position.z = playerPos.z
 
-      // Rotazione monete
-      coins.forEach((coin) => {
-        coin.rotation.z += 0.02
-      })
+      // Update target highlight
+      const target = getTarget()
+      if (target) {
+        highlight.visible = true
+        highlight.position.set(target.blockX + 0.5, target.blockY + 0.5, target.blockZ + 0.5)
+      } else {
+        highlight.visible = false
+      }
 
-      // Raccolta monete
-      for (let i = coins.length - 1; i >= 0; i--) {
-        const coin = coins[i]
-        const dx = playerPos.x - coin.position.x
-        const dz = playerPos.z - coin.position.z
-        const dist = Math.sqrt(dx * dx + dz * dz)
+      // Pickups update + collect
+      for (let i = pickups.length - 1; i >= 0; i--) {
+        const p = pickups[i]
+        const velY = (p.userData?.velY as number | undefined) ?? 0
+        p.userData.velY = Math.max(-0.08, velY - 0.004)
+        p.position.y += p.userData.velY
 
-        if (dist < 1) {
-          scene.remove(coin)
-          coins.splice(i, 1)
-          setScore((prev) => prev + 10)
-          setCoinsLeft((prev) => Math.max(0, prev - 1))
+        const ground = world.get(Math.floor(p.position.x), Math.floor(p.position.y - 0.2), Math.floor(p.position.z))
+        if (ground !== BlockId.Air && ground !== BlockId.Water) {
+          p.position.y = Math.floor(p.position.y) + 0.35
+          p.userData.velY = 0
+        }
+
+        const dx = p.position.x - playerPos.x
+        const dy = p.position.y - (playerPos.y + 0.9)
+        const dz = p.position.z - playerPos.z
+        if (dx * dx + dy * dy + dz * dz < 1.1) {
+          scene.remove(p)
+          p.geometry.dispose()
+          ;(p.material as THREE.Material).dispose()
+          pickups.splice(i, 1)
         }
       }
 
@@ -266,17 +589,28 @@ export function FlatMapGame() {
       document.removeEventListener('pointerlockchange', onPointerLockChange)
       document.removeEventListener('pointerlockerror', onPointerLockError)
       containerEl.removeEventListener('pointerdown', requestPointerLock)
+      containerEl.removeEventListener('pointerdown', onActionPointerDown)
+      containerEl.removeEventListener('contextmenu', preventContextMenu)
 
       if (containerEl && renderer.domElement.parentNode) {
         containerEl.removeChild(renderer.domElement)
       }
 
-      floorGeometry.dispose()
-      floorMaterial.dispose()
-      horizonGeometry.dispose()
-      horizonMaterial.dispose()
-      coinGeometry.dispose()
-      coinMaterial.dispose()
+      chunkMaterial.dispose()
+      waterMaterial.dispose()
+      for (const cr of chunkRenders.values()) {
+        scene.remove(cr.opaqueMesh)
+        scene.remove(cr.waterMesh)
+        cr.opaqueMesh.geometry.dispose()
+        cr.waterMesh.geometry.dispose()
+      }
+      for (const p of pickups) {
+        scene.remove(p)
+        p.geometry.dispose()
+        ;(p.material as THREE.Material).dispose()
+      }
+      highlightGeometry.dispose()
+      highlightMaterial.dispose()
       renderer.dispose()
     }
   }, [])
@@ -284,13 +618,33 @@ export function FlatMapGame() {
   return (
     <div ref={containerRef} className="flat-map-game-container" tabIndex={0}>
       <div className="flat-map-hud">
-        <h2>🎮 Gioco Prima Persona</h2>
-        <p>Score: {score}</p>
-        <p>Monete: {coinsLeft}</p>
+        <h2>Voxel Prototype</h2>
         <p>👆 Clicca per attivare mouse</p>
         <p>WASD: muoviti</p>
         <p>Shift: corri</p>
+        <p>Spazio: salta</p>
+        <p>Click: rompi blocco</p>
+        <p>Tasto destro: piazza</p>
+        <p>1-9: seleziona hotbar</p>
         <p>Mouse: guarda in giro</p>
+      </div>
+      <div className="flat-map-crosshair" />
+      <div className="flat-map-hotbar">
+        {hotbar.map((id, idx) => (
+          <div
+            key={idx}
+            className={
+              'flat-map-hotbar-slot' + (idx === selectedSlot ? ' is-selected' : '')
+            }
+          >
+            <div
+              className="flat-map-hotbar-swatch"
+              style={{ background: BLOCKS[id].cssColor }}
+              aria-hidden
+            />
+            <div className="flat-map-hotbar-label">{idx + 1}</div>
+          </div>
+        ))}
       </div>
     </div>
   )
