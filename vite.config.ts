@@ -5,4 +5,14 @@ import { powerApps } from "@microsoft/power-apps-vite/plugin"
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), powerApps()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          three: ['three'],
+          vendor: ['react', 'react-dom']
+        }
+      }
+    }
+  }
 });

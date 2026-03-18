@@ -263,7 +263,7 @@ function buildByFilter(
 
   // sanity: indices / 3 equals triangleCount
   // (left as runtime invariant; no throwing in prod)
-  if (process.env.NODE_ENV !== 'production') {
+  if (import.meta.env?.DEV) {
     const actualTriangles = Math.floor(indices.length / 3)
     if (actualTriangles !== triangleCount) {
       // eslint-disable-next-line no-console

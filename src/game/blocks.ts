@@ -1,21 +1,23 @@
-export enum BlockId {
-  Air = 0,
-  Grass = 1,
-  Dirt = 2,
-  Stone = 3,
-  Wood = 12,
-  Leaves = 13,
-  Sand = 14,
-  Water = 15,
-  Red = 4,
-  Orange = 5,
-  Yellow = 6,
-  Green = 7,
-  Cyan = 8,
-  Blue = 9,
-  Purple = 10,
-  Pink = 11,
-}
+export const BlockId = {
+  Air: 0,
+  Grass: 1,
+  Dirt: 2,
+  Stone: 3,
+  Wood: 12,
+  Leaves: 13,
+  Sand: 14,
+  Water: 15,
+  Red: 4,
+  Orange: 5,
+  Yellow: 6,
+  Green: 7,
+  Cyan: 8,
+  Blue: 9,
+  Purple: 10,
+  Pink: 11,
+} as const
+
+export type BlockId = (typeof BlockId)[keyof typeof BlockId]
 
 export type BlockDef = {
   id: BlockId

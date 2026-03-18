@@ -22,6 +22,7 @@ export function FlatMapGame() {
     // === SCENE SETUP ===
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0x87ceeb) // Sky blue
+    scene.fog = new THREE.FogExp2(0x87ceeb, 0.005)
 
     const width = window.innerWidth
     const height = window.innerHeight
@@ -33,13 +34,30 @@ export function FlatMapGame() {
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setSize(width, height)
     renderer.setPixelRatio(window.devicePixelRatio)
+    renderer.shadowMap.enabled = true
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    renderer.toneMapping = THREE.ACESFilmicToneMapping
+    renderer.toneMappingExposure = 1.0
     containerEl.appendChild(renderer.domElement)
 
     // === LIGHTING ===
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 1)
-    directionalLight.position.set(10, 10, 5)
-    scene.add(directionalLight)
-    scene.add(new THREE.AmbientLight(0xffffff, 0.5))
+    const hemisphereLight = new THREE.HemisphereLight(0xadd8e6, 0x3a4b5c, 0.4)
+    scene.add(hemisphereLight)
+
+    const sunLight = new THREE.DirectionalLight(0xfffaed, 2.5)
+    sunLight.position.set(50, 80, 20)
+    sunLight.castShadow = true
+    sunLight.shadow.mapSize.width = 2048
+    sunLight.shadow.mapSize.height = 2048
+    sunLight.shadow.camera.near = 0.5
+    sunLight.shadow.camera.far = 150
+    sunLight.shadow.camera.left = -64
+    sunLight.shadow.camera.right = 64
+    sunLight.shadow.camera.top = 64
+    sunLight.shadow.camera.bottom = -64
+    sunLight.shadow.bias = -0.0005
+    scene.add(sunLight)
+    scene.add(sunLight.target)
 
     // === CHUNKED WORLD (bigger map) ===
     const seed = 1337
@@ -47,27 +65,27 @@ export function FlatMapGame() {
       seed,
       chunkSize: 16,
       height: 128,
-      baseHeight: 32,
-      heightScale: 28,
-      freq: 2.2,
+      baseHeight: 38,
+      heightScale: 40,
+      freq: 2.5,
       octaves: 6,
       lacunarity: 2,
       persistence: 0.5,
       stoneDepth: 8,
-      pondLevel: 22,
+      pondLevel: 24,
     })
 
     // === CHUNK MESH (single chunk for MVP) ===
     const chunkMaterial = new THREE.MeshStandardMaterial({
       vertexColors: true,
-      roughness: 1,
+      roughness: 0.8,
     })
     const waterMaterial = new THREE.MeshStandardMaterial({
       vertexColors: true,
-      roughness: 0.35,
-      metalness: 0,
+      roughness: 0.1,
+      metalness: 0.8,
       transparent: true,
-      opacity: 0.65,
+      opacity: 0.8,
       depthWrite: false,
     })
     type ChunkRender = {
@@ -86,7 +104,10 @@ export function FlatMapGame() {
       if (existing) return existing
 
       const opaque = new THREE.Mesh(new THREE.BufferGeometry(), chunkMaterial)
+      opaque.castShadow = true
+      opaque.receiveShadow = true
       const water = new THREE.Mesh(new THREE.BufferGeometry(), waterMaterial)
+      water.receiveShadow = true
       water.renderOrder = 1
       scene.add(opaque)
       scene.add(water)
@@ -132,7 +153,7 @@ export function FlatMapGame() {
       cr.waterMesh.geometry.computeBoundingSphere()
     }
 
-    const chunkRadius = 2
+    const chunkRadius = 6 // Increased to make the map vast
     const updateActiveChunks = () => {
       const pcx = Math.floor(playerPos.x / world.chunkSize)
       const pcz = Math.floor(playerPos.z / world.chunkSize)
@@ -206,7 +227,7 @@ export function FlatMapGame() {
     scene.add(highlight)
 
     // === PLAYER POSITION (feet position in world units) ===
-    const playerPos = new THREE.Vector3(8, 55, 8)
+    const playerPos = new THREE.Vector3(8, 90, 8)
     const eyeHeight = 1.6
 
     // === JUMP / GRAVITY ===
@@ -247,7 +268,7 @@ export function FlatMapGame() {
     }
 
     // If we spawned inside blocks, move up a bit.
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 60; i++) {
       if (!aabbOverlapsSolid(playerPos.x, playerPos.y, playerPos.z)) break
       playerPos.y += 1
     }
@@ -560,6 +581,10 @@ export function FlatMapGame() {
           pickups.splice(i, 1)
         }
       }
+
+      sunLight.position.set(playerPos.x + 50, playerPos.y + 80, playerPos.z + 20)
+      sunLight.target.position.copy(playerPos)
+      sunLight.target.updateMatrixWorld()
 
       renderer.render(scene, camera)
     }
