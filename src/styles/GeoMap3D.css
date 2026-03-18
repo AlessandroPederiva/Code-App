@@ -1,0 +1,64 @@
+.geo-map-container {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.geo-map-container canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.map-info {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  background: rgba(0, 0, 0, 0.8);
+  color: white;
+  padding: 20px;
+  border-radius: 8px;
+  max-width: 300px;
+  z-index: 100;
+  font-family: Arial, sans-serif;
+}
+
+.map-info h2 {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+}
+
+.map-info p {
+  margin: 0 0 15px 0;
+  font-size: 14px;
+  opacity: 0.9;
+}
+
+.map-info ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.map-info li {
+  font-size: 14px;
+  margin: 5px 0;
+  padding: 5px 0;
+}
+
+/* Cesium widget styles */
+.cesium-viewer {
+  font-family: sans-serif;
+}
+
+.cesium-viewer-toolbar {
+  right: 10px;
+  top: 10px;
+}
+
+.cesium-credit-container {
+  bottom: 0;
+  right: 0;
+  font-size: 10px;
+  opacity: 0.6;
+}
