@@ -26,6 +26,7 @@ export class ChunkedWorld {
   readonly pondLevel: number
 
   private chunks = new Map<string, Chunk>()
+  private pondLevelCache = new Map<string, number>()
 
   constructor(opts: {
     seed: number
@@ -150,6 +151,45 @@ export class ChunkedWorld {
     return -1
   }
 
+  private getNaturalHeight(gx: number, gz: number): number {
+    const nx = gx / 512
+    const nz = gz / 512
+
+    // Continental noise for macro-variance
+    const cont = fbm2(nx / 3, nz / 3, this.seed + 123, 1.0, 3, 2.0, 0.5) // [0..1]
+    const localHeightScale = this.heightScale * (0.5 + cont * 1.5)
+
+    // Domain warping
+    const warpX = fbm2(nx, nz, this.seed + 234, this.freq, 2, 2.0, 0.5) * 0.2
+    const warpZ = fbm2(nx, nz, this.seed + 345, this.freq, 2, 2.0, 0.5) * 0.2
+
+    const e = fbm2(nx + warpX, nz + warpZ, this.seed, this.freq, this.octaves, this.lacunarity, this.persistence)
+
+    return clampHeight(
+      Math.floor(this.baseHeight + (e - 0.5) * 2 * localHeightScale),
+      2,
+      this.height - 3,
+    )
+  }
+
+  private getPondMaxLevel(centerX: number, centerZ: number, radius: number): number {
+    const key = `${centerX},${centerZ}`
+    if (this.pondLevelCache.has(key)) return this.pondLevelCache.get(key)!
+
+    let minH = 255
+    const circum = Math.PI * 2
+    for (let i = 0; i < 12; i++) {
+      const ang = (i / 12) * circum
+      const px = centerX + Math.cos(ang) * radius
+      const pz = centerZ + Math.sin(ang) * radius
+      const nH = this.getNaturalHeight(px, pz)
+      if (nH < minH) minH = nH
+    }
+    const level = minH - 1
+    this.pondLevelCache.set(key, level)
+    return level
+  }
+
   private generateChunk(chunk: Chunk): void {
     const { cx, cz } = chunk
     const cs = this.chunkSize
@@ -159,15 +199,7 @@ export class ChunkedWorld {
         const gx = cx * cs + lx
         const gz = cz * cs + lz
 
-        const nx = gx / 512
-        const nz = gz / 512
-
-        const e = fbm2(nx, nz, this.seed, this.freq, this.octaves, this.lacunarity, this.persistence)
-        let h = clampHeight(
-          Math.floor(this.baseHeight + (e - 0.5) * 2 * this.heightScale),
-          2,
-          this.height - 3,
-        )
+        let h = this.getNaturalHeight(gx, gz)
 
         // --- ponds: carve local basins, then fill to pondLevel ---
         // Choose a few pond centers deterministically on a coarse grid
@@ -176,6 +208,7 @@ export class ChunkedWorld {
         const cellZ = Math.floor(gz / cellSize)
 
         let pondInfluence = 0
+        let bestPondLevel = this.pondLevel
         for (let dz = -1; dz <= 1; dz++) {
           for (let dx = -1; dx <= 1; dx++) {
             const pxCell = cellX + dx
@@ -193,7 +226,10 @@ export class ChunkedWorld {
             if (dist > radius) continue
 
             const t = 1 - dist / radius
-            pondInfluence = Math.max(pondInfluence, t)
+            if (t > pondInfluence) {
+              pondInfluence = t
+              bestPondLevel = this.getPondMaxLevel(centerX, centerZ, radius)
+            }
           }
         }
 
@@ -202,12 +238,14 @@ export class ChunkedWorld {
           h = clampHeight(h - carve, 1, this.height - 3)
         }
 
+        const localPondLevel = Math.min(this.pondLevel, bestPondLevel)
+
         // write column
         for (let y = 0; y <= h; y++) {
           const idx = this.indexLocal(lx, y, lz)
           if (y === h) {
             // sand near pond edges (only if pond exists nearby)
-            if (pondInfluence > 0.2 && Math.abs(h - this.pondLevel) <= 1) {
+            if (pondInfluence > 0.2 && Math.abs(h - localPondLevel) <= 1) {
               chunk.data[idx] = BlockId.Sand
             } else {
               chunk.data[idx] = BlockId.Grass
@@ -220,8 +258,8 @@ export class ChunkedWorld {
         }
 
         // fill pond water only when basin is below pondLevel and pondInfluence is present
-        if (pondInfluence > 0.25 && h < this.pondLevel) {
-          const maxY = Math.min(this.pondLevel, this.height - 2)
+        if (pondInfluence > 0.25 && h < localPondLevel) {
+          const maxY = Math.min(localPondLevel, this.height - 2)
           for (let y = h + 1; y <= maxY; y++) {
             const idx = this.indexLocal(lx, y, lz)
             if (chunk.data[idx] === BlockId.Air) {
